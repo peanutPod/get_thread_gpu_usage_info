@@ -1091,9 +1091,46 @@ ErrorCode MatMulExecution::onResize(const std::vector<Tensor *> &inputs, const s
     MNN_PRINT("- Need B Temp Buffer: %d\n", mNeedBTempBuffer);
     MNN_PRINT("- Need Convert Mat AB: %d\n", mNeedConvertMatAB);
 
-    // Rest of the implementation...
-    // ...existing memory allocation code...
 
+    auto pool = static_cast<CUDABackend*>(backend())->getBufferPool();
+    MemChunk bufferAData, bufferBData;
+    size_t convertBytes = 2;
+    if(mFp32Infer) {
+        convertBytes = 4;
+    }
+    if((mNeedConvertMatAB && mFp16Fp32MixInfer) || mNeedATempBuffer) {
+        bufferAData = pool->alloc(convertBytes * mBatch * mAs * mGemmInfo.elh[0] * mGemmInfo.elhPad[1]);
+        mTempMatA = (void*)bufferAData.ptr();
+    } else {
+        mTempMatA = (void *)A->deviceId();
+    }
+
+    if((mNeedConvertMatAB && mFp16Fp32MixInfer) || mNeedBTempBuffer) {
+        bufferBData = pool->alloc(convertBytes * mBatch * mBs * mGemmInfo.elh[2] * mGemmInfo.elhPad[1]);
+        mTempMatB = (void*)bufferBData.ptr();
+    } else {
+        mTempMatB = (void *)B->deviceId();
+    }
+
+    if(bufferAData.first != nullptr) {
+        pool->free(bufferAData);
+    }
+    if(bufferBData.first != nullptr) {
+        pool->free(bufferBData);
+    }
+ 
+    // inputSize only two, No need Bias, Fake address for mBiasPtr is ok because beta is zero.
+    if(inputs.size() == 2) {
+    	mBiasPtr = (void*)B->deviceId();
+    }
+    //printf("MatMulAB:%p-%p-%p-%p\n", A->host<void*>(), A->deviceId(), B->host<void*>(), B->deviceId());
+
+    mConvertGemmSplitK = ((mBatch == 1) && (mGemmInfo.elhPad[1] >= 16384));
+    // Set Cutlass Param Arguments
+    mResizeSetArgument = (mTempMatA != nullptr && mTempMatB != nullptr && C->deviceId() != 0);
+    if(mResizeSetArgument) {
+        setArguments(inputs, outputs);
+}
     MNN_PRINT("==============================\n\n");
     return NO_ERROR;
 }
@@ -1118,9 +1155,11 @@ ErrorCode MatMulExecution::onExecute(const std::vector<Tensor *> &inputs, const 
     MNN_PRINT("- Batch Size: %d\n", mBatch);
 
     // Get runtime info
-    auto runtime = static_cast<CUDABackend*>(backend())->getCUDARuntime();
     auto bytes = static_cast<CUDABackend*>(backend())->getBytes(inputs[0]);
+    auto runtime = static_cast<CUDABackend*>(backend())->getCUDARuntime();
 
+    bool hAlignment = (mGemmInfo.elhPad[2] == mGemmInfo.elh[2]);
+    
     // Print memory addresses
     MNN_PRINT("\nMemory Addresses:\n");
     MNN_PRINT("- Input A: %p\n", inputs[0]->deviceId());
@@ -1238,10 +1277,7 @@ ErrorCode MatMulExecution::onExecute(const std::vector<Tensor *> &inputs, const 
         } else {
             cutlass::Status status = mGemmBatchedCudaF32F32LnAlign1RC();
             cutlass_check(status);
-        }
-        auto endTime = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-        
+        }        
         MNN_PRINT("Execution completed in %.3f ms\n", duration.count() / 1000.0);
         MNN_PRINT("==============================\n\n");
         return NO_ERROR;
@@ -1277,9 +1313,6 @@ ErrorCode MatMulExecution::onExecute(const std::vector<Tensor *> &inputs, const 
             }
         }
     
-        auto endTime = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-        
         MNN_PRINT("Execution completed in %.3f ms\n", duration.count() / 1000.0);
         MNN_PRINT("==============================\n\n");
         return NO_ERROR;
@@ -1366,8 +1399,6 @@ ErrorCode MatMulExecution::onExecute(const std::vector<Tensor *> &inputs, const 
         }
     }
     // printf("normal:%d rrlayout:%d convertab:%d halign:%d\n", mFp16Fp32MixInfer, mUseRRLayout, mNeedConvertMatAB, hAlignment);
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
     
     MNN_PRINT("Execution completed in %.3f ms\n", duration.count() / 1000.0);
     MNN_PRINT("==============================\n\n");
